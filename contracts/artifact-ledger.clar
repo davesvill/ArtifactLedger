@@ -51,6 +51,21 @@
     }
 )
 
+(define-map authenticators principal
+    {
+        has-active-authentication: bool,
+        authenticated-item-id: uint,
+        authentication-focus: (string-ascii 64),
+        yearly-fee: uint,
+        authentication-start-height: uint,
+        authentication-end-height: uint,
+        total-authenticated-items: uint,
+        last-authentication-height: uint,
+        expertise: (string-ascii 64),
+        trust-score: uint
+    }
+)
+
 (define-map historical-items uint
     {
         institution-owner: principal,
@@ -97,6 +112,41 @@
     )
 )
 
+(define-private (validate-era (time-period (string-ascii 64)))
+    (let ((period-length (len time-period)))
+        (and (> period-length u0) (<= period-length u64))
+    )
+)
+
+(define-private (validate-details (item-details (string-ascii 256)))
+    (let ((details-length (len item-details)))
+        (and (> details-length u0) (<= details-length u256))
+    )
+)
+
+(define-private (validate-origin (origin-location (string-ascii 128)))
+    (let ((location-length (len origin-location)))
+        (and (> location-length u0) (<= location-length u128))
+    )
+)
+
+(define-private (calculate-system-fee (payment uint))
+    (/ (* payment SYSTEM_FEE_PERCENT) u100)
+)
+
+;; Read-Only Functions
+(define-read-only (get-institution-details (institution-address principal))
+    (map-get? heritage-institutions institution-address)
+)
+
+(define-read-only (get-authenticator-details (authenticator-address principal))
+    (map-get? authenticators authenticator-address)
+)
+
+(define-read-only (get-item-details (item-id uint))
+    (map-get? historical-items item-id)
+)
+
 (define-read-only (get-authentication-details (record-id uint))
     (map-get? authentication-records record-id)
 )
@@ -131,6 +181,87 @@
         }
     )
     (ok true))
+)
+
+;; Register as an item authenticator
+(define-public (register-authenticator (expertise (string-ascii 64)))
+    (let (
+        (existing-authenticator (map-get? authenticators tx-sender))
+        (current-height block-height)
+    )
+    (asserts! (not (var-get system-suspended)) ERR_PERMISSION_DENIED)
+    (asserts! (is-none existing-authenticator) ERR_EXISTING_RECORD)
+    (map-set authenticators tx-sender
+        {
+            has-active-authentication: false,
+            authenticated-item-id: u0,
+            authentication-focus: "",
+            yearly-fee: u0,
+            authentication-start-height: u0,
+            authentication-end-height: u0,
+            total-authenticated-items: u0,
+            last-authentication-height: u0,
+            expertise: expertise,
+            trust-score: u300
+        }
+    )
+    (ok true))
+)
+
+;; Register a historical item
+(define-public (register-historical-item 
+    (time-period (string-ascii 64)) 
+    (authentication-fee uint) 
+    (purchase-value uint)
+    (min-period uint)
+    (max-period uint)
+    (item-details (string-ascii 256))
+    (origin-location (string-ascii 128))
+    (scientifically-dated bool)
+)
+    (let (
+        (institution-details (unwrap! (map-get? heritage-institutions tx-sender) ERR_NO_RECORD_EXISTS))
+        (new-item-id (var-get total-registered-items))
+        (current-height block-height)
+    )
+    (asserts! (not (var-get system-suspended)) ERR_PERMISSION_DENIED)
+    (asserts! (get certified institution-details) ERR_PERMISSION_DENIED)
+    (asserts! (get operational-status institution-details) ERR_PERMISSION_DENIED)
+    (asserts! (< (get item-count institution-details) MAX_ITEMS_PER_MUSEUM) ERR_QUOTA_EXCEEDED)
+    (asserts! (validate-authentication-fee authentication-fee) ERR_INVALID_FEE)
+    (asserts! (validate-purchase-value purchase-value) ERR_TRANSACTION_INVALID)
+    (asserts! (>= max-period min-period) ERR_INVALID_TIMESPAN)
+    (asserts! (validate-era time-period) ERR_INVALID_ERA)
+    (asserts! (validate-details item-details) ERR_INVALID_DATA)
+    (asserts! (validate-origin origin-location) ERR_INVALID_ORIGIN)
+    
+    (map-set historical-items new-item-id
+        {
+            institution-owner: tx-sender,
+            time-period: time-period,
+            authentication-fee: authentication-fee,
+            purchase-value: purchase-value,
+            available-for-authentication: true,
+            active-authentication-count: u0,
+            registry-height: current-height,
+            min-authentication-period: min-period,
+            max-authentication-period: max-period,
+            item-details: item-details,
+            origin-location: origin-location,
+            scientifically-dated: scientifically-dated
+        }
+    )
+    
+    ;; Update institution's item count
+    (map-set heritage-institutions tx-sender
+        (merge institution-details { 
+            item-count: (+ (get item-count institution-details) u1),
+            recent-activity-height: current-height
+        })
+    )
+    
+    (var-set total-registered-items (+ new-item-id u1))
+    (ok new-item-id))
 )
 
 ;; Request item authentication
