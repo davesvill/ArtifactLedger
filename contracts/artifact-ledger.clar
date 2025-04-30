@@ -51,6 +51,64 @@
     }
 )
 
+(define-map historical-items uint
+    {
+        institution-owner: principal,
+        time-period: (string-ascii 64),
+        authentication-fee: uint,
+        purchase-value: uint,
+        available-for-authentication: bool,
+        active-authentication-count: uint,
+        registry-height: uint,
+        min-authentication-period: uint,
+        max-authentication-period: uint,
+        item-details: (string-ascii 256),
+        origin-location: (string-ascii 128),
+        scientifically-dated: bool
+    }
+)
+
+(define-map authentication-records uint
+    {
+        authenticator-address: principal,
+        fee-amount: uint,
+        current-status: (string-ascii 20),
+        submission-height: uint,
+        authentication-report: (string-ascii 256),
+        testing-facility: (optional principal),
+        authentication-duration: uint,
+        authentication-techniques: (string-ascii 128)
+    }
+)
+
+;; Private Functions
+(define-private (check-admin-privileges)
+    (is-eq tx-sender SYSTEM_ADMIN)
+)
+
+(define-private (validate-authentication-fee (fee-amount uint))
+    (>= fee-amount MIN_AUTHENTICATION_FEE)
+)
+
+(define-private (validate-purchase-value (purchase-value uint))
+    (and 
+        (> purchase-value u0)
+        (<= purchase-value MAX_ITEM_VALUE)
+    )
+)
+
+(define-read-only (get-authentication-details (record-id uint))
+    (map-get? authentication-records record-id)
+)
+
+(define-read-only (get-authentication-fund)
+    (var-get authentication-fund-balance)
+)
+
+(define-read-only (is-system-suspended)
+    (var-get system-suspended)
+)
+
 ;; Public Functions
 
 ;; Register as a heritage institution
@@ -72,5 +130,61 @@
             total-revenue: u0
         }
     )
+    (ok true))
+)
+
+;; Request item authentication
+(define-public (request-item-authentication (item-id uint) (authentication-period uint) (authentication-focus (string-ascii 64)))
+    (let (
+        (item-details (unwrap! (map-get? historical-items item-id) ERR_ITEM_NOT_FOUND))
+        (institution-details (unwrap! (map-get? heritage-institutions (get institution-owner item-details)) ERR_NO_RECORD_EXISTS))
+        (authenticator-details (unwrap! (map-get? authenticators tx-sender) ERR_UNAUTHORIZED_AUTHENTICATOR))
+        (current-height block-height)
+        (yearly-fee (get authentication-fee item-details))
+        (period-fee (* yearly-fee authentication-period))
+        (system-fee (calculate-system-fee period-fee))
+        (institution-payment (- period-fee system-fee))
+    )
+    (asserts! (not (var-get system-suspended)) ERR_PERMISSION_DENIED)
+    (asserts! (get available-for-authentication item-details) ERR_ITEM_UNAVAILABLE)
+    (asserts! (>= (get trust-score authenticator-details) MIN_AUTHENTICATOR_TRUST) ERR_UNAUTHORIZED_AUTHENTICATOR)
+    (asserts! (and 
+        (>= authentication-period (get min-authentication-period item-details))
+        (<= authentication-period (get max-authentication-period item-details))
+    ) ERR_INVALID_TIMESPAN)
+    
+    ;; Process payment
+    (try! (stx-transfer? period-fee tx-sender (get institution-owner item-details)))
+    
+    ;; Update authentication fund
+    (var-set authentication-fund-balance (+ (var-get authentication-fund-balance) system-fee))
+    
+    ;; Update authenticator record
+    (map-set authenticators tx-sender
+        (merge authenticator-details {
+            has-active-authentication: true,
+            authenticated-item-id: item-id,
+            authentication-focus: authentication-focus,
+            yearly-fee: yearly-fee,
+            authentication-start-height: current-height,
+            authentication-end-height: (+ current-height (* authentication-period BLOCKS_PER_YEAR)),
+            total-authenticated-items: (+ (get total-authenticated-items authenticator-details) u1),
+            last-authentication-height: current-height
+        })
+    )
+    
+    ;; Update item authentication count
+    (map-set historical-items item-id
+        (merge item-details { active-authentication-count: (+ (get active-authentication-count item-details) u1) })
+    )
+    
+    ;; Update institution earnings
+    (map-set heritage-institutions (get institution-owner item-details)
+        (merge institution-details { 
+            total-revenue: (+ (get total-revenue institution-details) institution-payment),
+            recent-activity-height: current-height
+        })
+    )
+    
     (ok true))
 )
